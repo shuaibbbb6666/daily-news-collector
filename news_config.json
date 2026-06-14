@@ -1,0 +1,7 @@
+{
+  "email": {
+    "smtp_server": "smtp.qq.com",
+    "smtp_port": 465
+  },
+  "_说明": "此文件仅保留非敏感配置。邮箱密码和 API Key 通过 GitHub Secrets 注入。"
+}
