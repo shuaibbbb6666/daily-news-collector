@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日新闻收集脚本 - 信息技术与教育领域
+每日新闻收集脚本 — 信息技术与教育领域
++ GitHub 热门项目 Top 5
 每天早上 9:00（北京时间）通过 GitHub Actions 自动运行
-敏感信息通过环境变量注入，不再硬编码在文件中
 """
 
 import os
 import json
+import re
 import smtplib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import requests
 
 
-# ==================== 配置区域 ====================
-# 敏感信息从环境变量读取（由 GitHub Secrets 注入）
+# ==================== 配置 ====================
 
 EMAIL_CONFIG = {
     "smtp_server": os.getenv("SMTP_SERVER", "smtp.qq.com"),
@@ -36,7 +37,6 @@ TIANAPI_CONFIG = {
     "api_name": "generalnews",
 }
 
-# 教育和信息技术相关的关键词
 KEYWORDS = [
     "教育", "学校", "大学", "高校", "教师", "学生", "教学", "学习",
     "人工智能", "AI", "机器学习", "大数据", "云计算", "物联网",
@@ -45,270 +45,473 @@ KEYWORDS = [
     "机器人", "量子", "卫星", "航天",
 ]
 
-# 非敏感配置可以从 JSON 文件加载（可选）
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "news_config.json")
-
-# 日志保存目录（GitHub Actions 中通过 artifact 上传）
 LOG_DIR = os.path.join(os.path.dirname(__file__), "news_logs")
+
+# GitHub Trending 配置
+GITHUB_TRENDING_DAYS = 7  # 抓取最近 N 天的热门项目
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
 
 # =================================================
 
 
+def fetch_article_detail(url: str, timeout: int = 8) -> str:
+    """从新闻原文 URL 提取详细描述（meta description 或首段文字）"""
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=timeout)
+        resp.encoding = resp.apparent_encoding or "utf-8"
+        html = resp.text
+
+        # 尝试提取 og:description
+        m = re.search(r'<meta[^>]+property="og:description"[^>]+content="([^"]+)"', html)
+        if m:
+            return m.group(1).strip()
+
+        # 尝试提取 meta description
+        m = re.search(r'<meta[^>]+name="description"[^>]+content="([^"]+)"', html)
+        if m:
+            return m.group(1).strip()
+
+        # 尝试提取第一段有意义的 <p> 文字
+        # 去掉 script/style 标签
+        cleaned = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
+        cleaned = re.sub(r'<style[^>]*>.*?</style>', '', cleaned, flags=re.DOTALL)
+        paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', cleaned, flags=re.DOTALL)
+        for p in paragraphs:
+            text = re.sub(r'<[^>]+>', '', p).strip()
+            # 过滤太短或明显不是正文的段落
+            if len(text) > 30 and not text.startswith("<"):
+                return text[:300]
+
+        return ""
+    except Exception:
+        return ""
+
+
 class NewsCollector:
-    """新闻收集器类"""
+    """新闻 + GitHub Trending 收集器"""
 
     def __init__(self):
         self.news_items: List[Dict] = []
-        self.headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        }
+        self.trending_repos: List[Dict] = []
 
     def load_config(self):
-        """加载非敏感配置文件（可选）"""
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 config = json.load(f)
                 email_cfg = config.get("email", {})
                 for key in ("smtp_server", "smtp_port"):
-                    if key in email_cfg and not os.getenv(
-                        key.upper() if key != "smtp_port" else "SMTP_PORT"
-                    ):
+                    if key in email_cfg:
                         if key == "smtp_port":
                             EMAIL_CONFIG[key] = int(email_cfg[key])
                         else:
                             EMAIL_CONFIG[key] = email_cfg[key]
 
+    # ---------- 新闻 ----------
+
     def search_news(self) -> List[Dict]:
-        """从天行数据 API 获取新闻"""
+        """从天行数据 API 获取新闻，并发抓取详细描述"""
         yesterday = datetime.now() - timedelta(days=1)
         yesterday_chinese = yesterday.strftime("%Y年%m月%d日")
         news_list: List[Dict] = []
 
         try:
             url = f"{TIANAPI_CONFIG['base_url']}/{TIANAPI_CONFIG['api_name']}/index"
-            params = {
-                "key": TIANAPI_CONFIG["api_key"],
-                "num": 50,
-                "page": 1,
-            }
+            params = {"key": TIANAPI_CONFIG["api_key"], "num": 50, "page": 1}
+            print(f"调用天行数据 API: {url}")
+            resp = requests.get(url, params=params, timeout=15)
 
-            print(f"正在调用天行数据 API: {url}")
-            response = requests.get(url, params=params, timeout=15)
+            if resp.status_code != 200:
+                raise Exception(f"HTTP {resp.status_code}")
 
-            if response.status_code == 200:
-                data = response.json()
+            data = resp.json()
+            if data.get("code") == 200 and "result" in data:
+                raw_items = data["result"].get("newslist", [])
 
-                if data.get("code") == 200 and "result" in data:
-                    news_items = data["result"].get("newslist", [])
+                # 按关键词筛选
+                for item in raw_items:
+                    title = item.get("title", "")
+                    desc = item.get("description", "")
+                    if any(kw in title or kw in desc for kw in KEYWORDS):
+                        ctime = item.get("ctime", "")
+                        date_str = ctime.split()[0] if ctime else yesterday_chinese
+                        news_list.append({
+                            "title": title,
+                            "summary": desc or "加载中...",
+                            "source": item.get("source", "未知来源"),
+                            "date": date_str,
+                            "url": item.get("url", ""),
+                        })
 
-                    for item in news_items:
-                        title = item.get("title", "")
-                        description = item.get("description", "")
+                # 取前 10 条
+                news_list = news_list[:10]
 
-                        is_relevant = any(
-                            keyword in title or keyword in description
-                            for keyword in KEYWORDS
-                        )
+                # 并发抓取详细描述
+                if news_list:
+                    print(f"筛选出 {len(news_list)} 条新闻，正在抓取详细描述...")
+                    self._enrich_news_details(news_list)
 
-                        if is_relevant:
-                            ctime = item.get("ctime", "")
-                            date_str = (
-                                ctime.split()[0] if ctime else yesterday_chinese
-                            )
-
-                            news_list.append({
-                                "title": title,
-                                "summary": (
-                                    description[:200] + "..."
-                                    if description
-                                    else "暂无摘要"
-                                ),
-                                "source": item.get("source", "未知来源"),
-                                "date": date_str,
-                                "url": item.get("url", ""),
-                            })
-
-                    news_list = news_list[:12]
-
-            print(f"API 返回代码: {data.get('code')}, 消息: {data.get('msg')}")
+            print(f"API 返回: code={data.get('code')}, msg={data.get('msg')}")
 
         except Exception as e:
-            print(f"获取新闻时出错: {e}")
-            news_list = [
-                {
-                    "title": f"新闻收集暂时不可用 - {yesterday_chinese}",
-                    "summary": f"错误信息: {str(e)}，请稍后检查...",
-                    "source": "系统提示",
-                    "date": yesterday_chinese,
-                    "url": "https://www.baidu.com",
-                }
-            ]
+            print(f"获取新闻出错: {e}")
+            news_list = [{
+                "title": f"新闻收集暂时不可用 - {yesterday_chinese}",
+                "summary": str(e),
+                "source": "系统提示",
+                "date": yesterday_chinese,
+                "url": "",
+            }]
 
         self.news_items = news_list
         return news_list
 
-    def format_news_report(self, news_data: List[Dict]) -> str:
-        """格式化新闻报告为 HTML 邮件"""
+    def _enrich_news_details(self, news_list: List[Dict]):
+        """并发抓取每条新闻的详细描述"""
+        def fetch_one(idx: int, item: Dict):
+            url = item.get("url", "")
+            if not url:
+                return idx, item["summary"]
+            detail = fetch_article_detail(url)
+            if detail and len(detail) > len(item.get("summary", "")):
+                return idx, detail
+            return idx, item["summary"]
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(fetch_one, i, n): i for i, n in enumerate(news_list)}
+            for future in as_completed(futures):
+                try:
+                    idx, summary = future.result()
+                    if summary:
+                        news_list[idx]["summary"] = summary
+                except Exception:
+                    pass
+
+    # ---------- GitHub Trending ----------
+
+    def search_github_trending(self) -> List[Dict]:
+        """通过 GitHub Search API 获取最近一周最热门的项目"""
+        since = (datetime.now() - timedelta(days=GITHUB_TRENDING_DAYS)).strftime("%Y-%m-%d")
+        repos: List[Dict] = []
+
+        try:
+            url = "https://api.github.com/search/repositories"
+            params = {
+                "q": f"created:>={since}",
+                "sort": "stars",
+                "order": "desc",
+                "per_page": 5,
+            }
+            print(f"调用 GitHub Search API: created:>={since}")
+            resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+
+            if resp.status_code != 200:
+                raise Exception(f"HTTP {resp.status_code}")
+
+            data = resp.json()
+            for item in data.get("items", [])[:5]:
+                repos.append({
+                    "name": item.get("full_name", ""),
+                    "url": item.get("html_url", ""),
+                    "description": item.get("description", "") or "暂无描述",
+                    "stars": item.get("stargazers_count", 0),
+                    "language": item.get("language", "Unknown"),
+                    "topics": item.get("topics", [])[:5],
+                    "forks": item.get("forks_count", 0),
+                })
+
+            # 补充每个项目的 README 摘要
+            if repos:
+                print(f"获取到 {len(repos)} 个热门项目，正在抓取简介...")
+                self._enrich_repo_details(repos)
+
+        except Exception as e:
+            print(f"获取 GitHub Trending 出错: {e}")
+            repos = []
+
+        self.trending_repos = repos
+        return repos
+
+    def _enrich_repo_details(self, repos: List[Dict]):
+        """获取每个仓库的 README 摘要"""
+        def fetch_one(idx: int, repo: Dict):
+            try:
+                readme_url = f"https://api.github.com/repos/{repo['name']}/readme"
+                resp = requests.get(readme_url, headers=HEADERS, timeout=8)
+                if resp.status_code == 200:
+                    import base64
+                    content = base64.b64decode(resp.json().get("content", "")).decode("utf-8", errors="replace")
+                    # 取 README 前 400 个非空字符作为摘要
+                    clean = re.sub(r'[#*`>\[\]!()]', '', content)
+                    clean = re.sub(r'\n{2,}', '\n', clean)
+                    lines = [l.strip() for l in clean.split('\n') if len(l.strip()) > 20]
+                    summary = " ".join(lines[:3])[:400]
+                    return idx, summary
+            except Exception:
+                pass
+            return idx, ""
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(fetch_one, i, r): i for i, r in enumerate(repos)}
+            for future in as_completed(futures):
+                try:
+                    idx, readme_summary = future.result()
+                    if readme_summary:
+                        repos[idx]["readme_summary"] = readme_summary
+                except Exception:
+                    pass
+
+    # ---------- 格式化 ----------
+
+    def format_news_section(self) -> str:
+        """生成新闻部分 HTML"""
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y年%m月%d日")
+        html = f"""
+    <!-- 新闻区块 -->
+    <div class="section-header section-news">
+      <span class="section-icon">📰</span> 信息技术与教育 · 昨日要闻
+      <span class="section-date">{yesterday}</span>
+    </div>
+    <div class="news-list">
+"""
+        if not self.news_items:
+            html += '<div class="empty-hint">今日暂无相关新闻</div>'
+        else:
+            for i, news in enumerate(self.news_items, 1):
+                url_link = (
+                    f'<a href="{news["url"]}" target="_blank">{news["title"]}</a>'
+                    if news["url"] else news["title"]
+                )
+                html += f"""
+      <div class="news-item">
+        <div class="news-index">
+          <span class="index-dot">{i}</span>
+          <span class="news-source">{news['source']}</span>
+        </div>
+        <div class="news-title">{url_link}</div>
+        <div class="news-summary">{news['summary']}</div>
+      </div>"""
+        html += "\n    </div>"
+        return html
+
+    def format_trending_section(self) -> str:
+        """生成 GitHub Trending 部分 HTML"""
+        html = f"""
+    <!-- Trending 区块 -->
+    <div class="section-header section-trending">
+      <span class="section-icon">⭐</span> GitHub 本周热门项目 Top 5
+      <span class="section-date">{GITHUB_TRENDING_DAYS} 日内新星</span>
+    </div>
+    <div class="trending-list">
+"""
+        if not self.trending_repos:
+            html += '<div class="empty-hint">暂时无法获取 GitHub 热门项目</div>'
+        else:
+            for i, repo in enumerate(self.trending_repos, 1):
+                topics_html = " ".join(
+                    f'<span class="topic-tag">{t}</span>' for t in repo.get("topics", [])
+                )
+                readme_extra = ""
+                if repo.get("readme_summary"):
+                    readme_extra = (
+                        f'<div class="repo-readme">📖 {repo["readme_summary"]}</div>'
+                    )
+                html += f"""
+      <div class="repo-item">
+        <div class="repo-rank">#{i}</div>
+        <div class="repo-info">
+          <div class="repo-name">
+            <a href="{repo['url']}" target="_blank">{repo['name']}</a>
+          </div>
+          <div class="repo-desc">{repo['description']}</div>
+          {readme_extra}
+          <div class="repo-meta">
+            <span class="repo-stars">⭐ {repo['stars']:,}</span>
+            <span class="repo-forks">🔀 {repo['forks']:,}</span>
+            <span class="repo-lang">📄 {repo['language']}</span>
+            {topics_html}
+          </div>
+        </div>
+      </div>"""
+        html += "\n    </div>"
+        return html
+
+    def format_email_html(self) -> str:
+        """生成完整 HTML 邮件"""
         today = datetime.now().strftime("%Y年%m月%d日")
         now_time = datetime.now().strftime("%H:%M")
 
-        html = f"""<!DOCTYPE html>
+        news_html = self.format_news_section()
+        trending_html = self.format_trending_section()
+        total_news = len(self.news_items)
+        total_repos = len(self.trending_repos)
+
+        return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
-  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif; background: #f5f7fa; margin: 0; padding: 20px; color: #333; }}
-  .container {{ max-width: 680px; margin: 0 auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); overflow: hidden; }}
-  .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; padding: 28px 30px; text-align: center; }}
-  .header h1 {{ margin: 0; font-size: 22px; letter-spacing: 2px; }}
-  .header .date {{ margin-top: 8px; font-size: 13px; opacity: 0.9; }}
-  .summary-bar {{ background: #f0f4ff; padding: 12px 30px; font-size: 13px; color: #555; border-bottom: 1px solid #e8ecf1; }}
-  .news-list {{ padding: 10px 24px; }}
-  .news-item {{ padding: 16px 0; border-bottom: 1px solid #f0f0f0; }}
+  body {{ margin: 0; padding: 0; background: #f0f2f5; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; }}
+  .container {{ max-width: 640px; margin: 0 auto; background: #fff; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.06); }}
+  .header {{ background: linear-gradient(135deg, #1a1a2e 0%, #16213e 40%, #0f3460 100%); color: #fff; padding: 32px 28px; text-align: center; }}
+  .header h1 {{ margin: 0; font-size: 20px; font-weight: 700; letter-spacing: 1px; }}
+  .header .sub {{ margin-top: 6px; font-size: 12px; opacity: 0.7; }}
+  .stats {{ display: flex; justify-content: center; gap: 24px; padding: 14px; background: #fafbfc; border-bottom: 1px solid #eee; }}
+  .stats .stat {{ text-align: center; }}
+  .stats .stat-num {{ font-size: 22px; font-weight: 700; color: #333; }}
+  .stats .stat-label {{ font-size: 11px; color: #999; margin-top: 2px; }}
+  .section-header {{ padding: 14px 24px; font-size: 15px; font-weight: 700; border-bottom: 2px solid #f0f0f0; display: flex; align-items: center; gap: 8px; }}
+  .section-news {{ background: #fefefe; color: #333; }}
+  .section-trending {{ background: #fffdf5; color: #333; border-top: 4px solid #f0e68c; }}
+  .section-icon {{ font-size: 18px; }}
+  .section-date {{ margin-left: auto; font-size: 11px; color: #aaa; font-weight: 400; }}
+  .news-list {{ padding: 8px 20px; }}
+  .news-item {{ padding: 14px 0; border-bottom: 1px solid #f5f5f5; }}
   .news-item:last-child {{ border-bottom: none; }}
-  .news-item .index {{ display: inline-block; background: #667eea; color: #fff; width: 24px; height: 24px; line-height: 24px; text-align: center; border-radius: 50%; font-size: 12px; margin-right: 8px; vertical-align: middle; }}
-  .news-item .title {{ font-size: 16px; font-weight: 600; color: #222; margin: 6px 0; }}
-  .news-item .title a {{ color: #222; text-decoration: none; }}
-  .news-item .title a:hover {{ color: #667eea; }}
-  .news-item .summary {{ font-size: 13px; color: #666; line-height: 1.6; margin: 6px 0; }}
-  .news-item .meta {{ font-size: 12px; color: #999; }}
-  .footer {{ background: #fafbfc; padding: 20px 30px; text-align: center; font-size: 12px; color: #aaa; border-top: 1px solid #e8ecf1; }}
-  .footer a {{ color: #667eea; text-decoration: none; }}
+  .news-index {{ display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }}
+  .index-dot {{ display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; background: #1a1a2e; color: #fff; border-radius: 50%; font-size: 11px; font-weight: 600; flex-shrink: 0; }}
+  .news-source {{ font-size: 11px; color: #aaa; }}
+  .news-title {{ font-size: 15px; font-weight: 600; line-height: 1.5; margin-bottom: 5px; }}
+  .news-title a {{ color: #1a1a2e; text-decoration: none; }}
+  .news-title a:hover {{ color: #0f3460; text-decoration: underline; }}
+  .news-summary {{ font-size: 13px; color: #555; line-height: 1.7; }}
+  .trending-list {{ padding: 8px 20px; }}
+  .repo-item {{ display: flex; gap: 14px; padding: 16px 0; border-bottom: 1px solid #f5f5f5; }}
+  .repo-item:last-child {{ border-bottom: none; }}
+  .repo-rank {{ font-size: 20px; font-weight: 800; color: #e2c044; min-width: 32px; line-height: 1.4; }}
+  .repo-info {{ flex: 1; }}
+  .repo-name {{ font-size: 15px; font-weight: 600; margin-bottom: 3px; }}
+  .repo-name a {{ color: #0f3460; text-decoration: none; }}
+  .repo-name a:hover {{ text-decoration: underline; }}
+  .repo-desc {{ font-size: 13px; color: #555; line-height: 1.6; margin-bottom: 6px; }}
+  .repo-readme {{ font-size: 12px; color: #777; line-height: 1.6; background: #f9fafb; padding: 8px 12px; border-radius: 6px; margin-bottom: 6px; border-left: 3px solid #e2c044; }}
+  .repo-meta {{ font-size: 12px; color: #888; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }}
+  .repo-stars {{ color: #e2a020; font-weight: 600; }}
+  .repo-forks {{ color: #666; }}
+  .repo-lang {{ color: #666; }}
+  .topic-tag {{ display: inline-block; background: #eef2ff; color: #4a5fc1; padding: 1px 7px; border-radius: 10px; font-size: 11px; }}
+  .empty-hint {{ text-align: center; padding: 30px; color: #bbb; font-size: 13px; }}
+  .footer {{ background: #fafbfc; padding: 18px 24px; text-align: center; font-size: 11px; color: #bbb; border-top: 1px solid #eee; }}
+  .footer a {{ color: #888; text-decoration: none; }}
 </style>
 </head>
 <body>
 <div class="container">
   <div class="header">
-    <h1>📰 信息技术与教育 · 每日简报</h1>
-    <div class="date">{yesterday} 新闻汇总</div>
+    <h1>📬 科技早报</h1>
+    <div class="sub">{today} {now_time} · 由 GitHub Actions 自动生成</div>
   </div>
-  <div class="summary-bar">
-    📅 整理时间：{today} {now_time} &nbsp;|&nbsp; 📊 共收录 <b>{len(news_data)}</b> 条相关新闻
+  <div class="stats">
+    <div class="stat"><div class="stat-num">{total_news}</div><div class="stat-label">📰 科技新闻</div></div>
+    <div class="stat"><div class="stat-num">{total_repos}</div><div class="stat-label">⭐ 热门项目</div></div>
   </div>
-  <div class="news-list">
-"""
-
-        for i, news in enumerate(news_data, 1):
-            url_link = (
-                f'<a href="{news["url"]}" target="_blank">{news["title"]}</a>'
-                if news["url"]
-                else news["title"]
-            )
-            html += f"""
-    <div class="news-item">
-      <div><span class="index">{i}</span><span class="meta">来源：{news['source']}</span></div>
-      <div class="title">{url_link}</div>
-      <div class="summary">{news['summary']}</div>
-    </div>"""
-
-        html += f"""
-  </div>
+  {news_html}
+  {trending_html}
   <div class="footer">
-    本简报由自动化脚本通过 <a href="https://github.com/features/actions">GitHub Actions</a> 定时生成<br>
-    内容仅供参考，请以官方发布为准 · 如有疑问请联系 zqha@vip.163.com
+    本邮件由自动化脚本通过 <a href="https://github.com/features/actions">GitHub Actions</a> 定时生成<br>
+    内容仅供参考 · 数据来源：天行数据 & GitHub Search API
   </div>
 </div>
 </body>
 </html>"""
 
-        return html
+    # ---------- 邮件 ----------
 
     def send_email(self, subject: str, html_content: str) -> bool:
-        """发送 HTML 邮件"""
         try:
             msg = MIMEMultipart("alternative")
-            msg["From"] = formataddr(
-                (EMAIL_CONFIG["sender_name"], EMAIL_CONFIG["sender_email"])
-            )
+            msg["From"] = formataddr((EMAIL_CONFIG["sender_name"], EMAIL_CONFIG["sender_email"]))
             msg["To"] = EMAIL_CONFIG["receiver_email"]
             msg["Subject"] = subject
 
-            plain_text = (
-                f"每日新闻简报 - 共 {len(self.news_items)} 条新闻。"
-                "请使用支持 HTML 的邮件客户端查看完整内容。"
-            )
-            msg.attach(MIMEText(plain_text, "plain", "utf-8"))
+            plain = f"科技早报 — 共 {len(self.news_items)} 条新闻 + {len(self.trending_repos)} 个热门项目。请使用支持 HTML 的客户端查看。"
+            msg.attach(MIMEText(plain, "plain", "utf-8"))
             msg.attach(MIMEText(html_content, "html", "utf-8"))
 
-            with smtplib.SMTP_SSL(
-                EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"]
-            ) as server:
-                server.login(
-                    EMAIL_CONFIG["sender_email"], EMAIL_CONFIG["sender_password"]
-                )
+            with smtplib.SMTP_SSL(EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"]) as server:
+                server.login(EMAIL_CONFIG["sender_email"], EMAIL_CONFIG["sender_password"])
                 server.sendmail(
                     EMAIL_CONFIG["sender_email"],
                     [EMAIL_CONFIG["receiver_email"]],
                     msg.as_string(),
                 )
 
-            print(f"✅ 邮件已成功发送到 {EMAIL_CONFIG['receiver_email']}")
+            print(f"✅ 邮件已发送到 {EMAIL_CONFIG['receiver_email']}")
             return True
-
         except Exception as e:
-            print(f"❌ 邮件发送失败：{e}")
+            print(f"❌ 邮件发送失败: {e}")
             return False
 
-    def save_log(self, report_html: str):
-        """保存日志到本地文件（在 GitHub Actions 中会上传为 artifact）"""
-        os.makedirs(LOG_DIR, exist_ok=True)
-        log_file = os.path.join(
-            LOG_DIR, f"news_{datetime.now().strftime('%Y%m%d')}.txt"
-        )
+    # ---------- 日志 ----------
 
+    def save_log(self):
+        os.makedirs(LOG_DIR, exist_ok=True)
+        log_file = os.path.join(LOG_DIR, f"news_{datetime.now().strftime('%Y%m%d')}.txt")
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y年%m月%d日")
-        plain = f"每日新闻简报 - {yesterday}\n{'=' * 50}\n\n"
-        for i, news in enumerate(self.news_items, 1):
-            plain += f"[{i}] {news['title']}\n"
-            plain += f"    来源: {news['source']}\n"
-            plain += f"    链接: {news['url']}\n"
-            plain += f"    摘要: {news['summary']}\n\n"
+
+        plain = f"科技早报 - {yesterday}\n{'=' * 50}\n\n"
+        plain += "【📰 科技新闻】\n\n"
+        for i, n in enumerate(self.news_items, 1):
+            plain += f"[{i}] {n['title']}\n    来源: {n['source']}\n    {n['summary']}\n\n"
+
+        plain += "【⭐ GitHub 热门项目】\n\n"
+        for i, r in enumerate(self.trending_repos, 1):
+            plain += f"#{i} {r['name']}  ⭐{r['stars']:,}\n    {r['description']}\n    {r['url']}\n\n"
 
         with open(log_file, "w", encoding="utf-8") as f:
             f.write(plain)
+        print(f"📝 日志已保存: {log_file}")
 
-        print(f"📝 日志已保存到：{log_file}")
+    # ---------- 主流程 ----------
 
     def run(self):
-        """主运行函数"""
-        print("🚀 开始收集每日新闻...")
+        print("🚀 开始收集...")
 
         if not TIANAPI_CONFIG["api_key"]:
-            print("❌ 错误：未设置 TianAPI_KEY 环境变量！")
+            print("❌ 未设置 TianAPI_KEY")
             return
         if not EMAIL_CONFIG["sender_password"]:
-            print("❌ 错误：未设置 SENDER_PASSWORD 环境变量！")
+            print("❌ 未设置 SENDER_PASSWORD")
             return
 
         self.load_config()
 
-        print("📰 正在从天行数据获取新闻...")
-        news_data = self.search_news()
-        print(f"✅ 共收集到 {len(news_data)} 条新闻")
+        # 1. 新闻
+        print("📰 Step 1/2: 收集科技新闻...")
+        self.search_news()
 
-        report_html = self.format_news_report(news_data)
+        # 2. GitHub Trending
+        print("⭐ Step 2/2: 抓取 GitHub 热门项目...")
+        self.search_github_trending()
 
-        self.save_log(report_html)
+        # 3. 生成邮件
+        html = self.format_email_html()
 
+        # 4. 保存日志
+        self.save_log()
+
+        # 5. 发送
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y年%m月%d日")
-        subject = f"📰 信息技术与教育领域新闻简报 - {yesterday}"
-        success = self.send_email(subject, report_html)
+        subject = f"📬 科技早报 - {yesterday}"
+        ok = self.send_email(subject, html)
 
-        if success:
-            print("✨ 任务完成！邮件已发送。")
+        if ok:
+            print(f"✨ 完成！新闻 {len(self.news_items)} 条 + 项目 {len(self.trending_repos)} 个")
         else:
-            print("⚠️ 任务部分完成：邮件发送失败，请检查配置。")
+            print("⚠️ 邮件发送失败")
             exit(1)
 
 
 def main():
-    collector = NewsCollector()
-    collector.run()
+    NewsCollector().run()
 
 
 if __name__ == "__main__":
