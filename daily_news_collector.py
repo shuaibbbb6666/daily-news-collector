@@ -258,6 +258,63 @@ class NewsCollector:
 
         return items
 
+    # ---------- 网易科技 ----------
+
+    def search_163(self) -> List[Dict]:
+        """从网易科技首页抓取新闻标题和链接"""
+        items: List[Dict] = []
+        try:
+            resp = requests.get(
+                "https://tech.163.com/",
+                headers={**HEADERS, "Referer": "https://tech.163.com/"},
+                timeout=10,
+            )
+            links = re.findall(
+                r'href="(https://www\.163\.com/tech/article/[^"]+)"[^>]*>\s*([^<]+)\s*<',
+                resp.text,
+            )
+            seen = set()
+            for url, title in links[:5]:
+                title = title.strip()
+                if title and title not in seen:
+                    seen.add(title)
+                    items.append({
+                        "title": title,
+                        "summary": "来自网易科技",
+                        "source": "网易科技",
+                        "date": "",
+                        "url": url,
+                    })
+            print(f"163 tech: {len(items)} articles")
+        except Exception as e:
+            print(f"163 tech error: {e}")
+        return items
+
+    # ---------- 搜狐科技 ----------
+
+    def search_sohu(self) -> List[Dict]:
+        """从搜狐科技 API 获取新闻"""
+        items: List[Dict] = []
+        try:
+            resp = requests.get(
+                "https://v2.sohu.com/public-api/feed",
+                params={"scene": "CHANNEL", "sceneId": 15, "page": 1, "size": 5},
+                headers=HEADERS,
+                timeout=10,
+            )
+            for item in resp.json():
+                items.append({
+                    "title": item.get("title", ""),
+                    "summary": item.get("brief", "") or "来自搜狐科技",
+                    "source": f"搜狐科技·{item.get('authorName', '')}",
+                    "date": (item.get("publicTime") or "")[:16],
+                    "url": f"https://www.sohu.com/a/{item.get('id', '')}",
+                })
+            print(f"Sohu tech: {len(items)} articles")
+        except Exception as e:
+            print(f"Sohu tech error: {e}")
+        return items
+
     # ---------- GitHub Trending ----------
 
     def search_github_trending(self) -> List[Dict]:
@@ -549,30 +606,41 @@ class NewsCollector:
         self.load_config()
 
         # 1. 36氪 RSS
-        print("📰 Step 1/3: 抓取 36氪 科技新闻...")
+        print("📰 Step 1/4: 抓取 36氪...")
         kr36_news = self.search_36kr()
 
-        # 2. 天行数据新闻
-        print("📰 Step 2/3: 从天行数据获取新闻...")
+        # 2. 网易科技
+        print("📰 Step 2/4: 抓取网易科技...")
+        wangyi_news = self.search_163()
+
+        # 3. 搜狐科技
+        print("📰 Step 3/4: 抓取搜狐科技...")
+        sohu_news = self.search_sohu()
+
+        # 4. 天行数据新闻
+        print("📰 Step 4/5: 从天行数据获取新闻...")
         self.search_news()
 
-        # 将 36氪 新闻插入最前面
+        # 合并：36氪 > 网易 > 搜狐 > 天行
+        for item in reversed(sohu_news):
+            self.news_items.insert(0, item)
+        for item in reversed(wangyi_news):
+            self.news_items.insert(0, item)
         for item in reversed(kr36_news):
             self.news_items.insert(0, item)
-        # 总共保留 12 条
-        self.news_items = self.news_items[:12]
+        self.news_items = self.news_items[:15]
 
-        # 3. GitHub Trending
-        print("⭐ Step 3/3: 抓取 GitHub 热门项目...")
+        # 5. GitHub Trending
+        print("⭐ Step 5/5: 抓取 GitHub 热门项目...")
         self.search_github_trending()
 
-        # 3. 生成邮件
+        # 生成邮件
         html = self.format_email_html()
 
-        # 4. 保存日志
+        # 保存日志
         self.save_log()
 
-        # 5. 发送
+        # 发送
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y年%m月%d日")
         subject = f"📬 科技早报 - {yesterday}"
         ok = self.send_email(subject, html)
