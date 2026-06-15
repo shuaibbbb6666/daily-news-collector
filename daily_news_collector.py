@@ -17,6 +17,8 @@ from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
 from typing import List, Dict, Optional
 
+import xml.etree.ElementTree as ET
+
 import requests
 
 
@@ -66,6 +68,7 @@ LOG_DIR = os.path.join(os.path.dirname(__file__), "news_logs")
 
 # GitHub Trending 配置
 GITHUB_TRENDING_DAYS = 7  # 抓取最近 N 天的热门项目
+_36KR_FEED = "https://36kr.com/feed"  # 36氪 RSS
 
 HEADERS = {
     "User-Agent": (
@@ -209,6 +212,51 @@ class NewsCollector:
                         news_list[idx]["summary"] = summary
                 except Exception:
                     pass
+
+    # ---------- 36氪 ----------
+
+    def search_36kr(self) -> List[Dict]:
+        """从 36氪 RSS 获取最新科技新闻"""
+        items: List[Dict] = []
+        try:
+            resp = requests.get(_36KR_FEED, headers=HEADERS, timeout=15)
+            resp.encoding = "utf-8"
+            root = ET.fromstring(resp.text)
+
+            # RSS items are under channel/item
+            channel = root.find("channel")
+            if channel is None:
+                print("36kr RSS: no channel found")
+                return items
+
+            count = 0
+            for elem in channel.findall("item"):
+                if count >= 5:
+                    break
+                title = (elem.findtext("title") or "").strip()
+                link = (elem.findtext("link") or "").strip()
+                desc = (elem.findtext("description") or "").strip()
+                pub_date = (elem.findtext("pubDate") or "").strip()
+
+                # 去掉 HTML 标签
+                desc = re.sub(r"<[^>]+>", "", desc)[:250]
+                if not title:
+                    continue
+
+                items.append({
+                    "title": title,
+                    "summary": desc or "暂无摘要",
+                    "source": "36氪",
+                    "date": pub_date[:16] if pub_date else "",
+                    "url": link,
+                })
+                count += 1
+
+            print(f"36kr RSS: {len(items)} articles")
+        except Exception as e:
+            print(f"36kr RSS error: {e}")
+
+        return items
 
     # ---------- GitHub Trending ----------
 
@@ -500,12 +548,22 @@ class NewsCollector:
 
         self.load_config()
 
-        # 1. 新闻
-        print("📰 Step 1/2: 收集科技新闻...")
+        # 1. 36氪 RSS
+        print("📰 Step 1/3: 抓取 36氪 科技新闻...")
+        kr36_news = self.search_36kr()
+
+        # 2. 天行数据新闻
+        print("📰 Step 2/3: 从天行数据获取新闻...")
         self.search_news()
 
-        # 2. GitHub Trending
-        print("⭐ Step 2/2: 抓取 GitHub 热门项目...")
+        # 将 36氪 新闻插入最前面
+        for item in reversed(kr36_news):
+            self.news_items.insert(0, item)
+        # 总共保留 12 条
+        self.news_items = self.news_items[:12]
+
+        # 3. GitHub Trending
+        print("⭐ Step 3/3: 抓取 GitHub 热门项目...")
         self.search_github_trending()
 
         # 3. 生成邮件
