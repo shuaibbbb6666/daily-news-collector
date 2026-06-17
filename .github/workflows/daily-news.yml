@@ -2,7 +2,7 @@ name: Daily News Collector
 
 on:
   schedule:
-    - cron: "0 1 * * *"
+    - cron: "0 23 * * *"   # UTC 23:00 + 延迟 ≈ 北京时间 9:00
   workflow_dispatch:
 
 jobs:
