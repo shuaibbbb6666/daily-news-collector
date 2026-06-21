@@ -2,6 +2,7 @@ name: Daily News Collector
 
 on:
   repository_dispatch:
+    types: [daily-news]
   workflow_dispatch:
 
 jobs:
