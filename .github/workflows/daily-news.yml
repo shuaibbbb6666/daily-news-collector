@@ -1,8 +1,8 @@
 name: Daily News Collector
 
 on:
-  repository_dispatch:
-    types: [daily-news]
+  schedule:
+    - cron: "0 17 * * *"   # UTC 17:00 + 延迟 ≈ 北京时间 7:00-13:00
   workflow_dispatch:
 
 jobs:
